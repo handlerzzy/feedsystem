@@ -1,0 +1,38 @@
+# 代码生成配置。
+#
+# 用**本地插件**（protoc-gen-go / protoc-gen-go-grpc）而不是 buf 的远程插件：
+# 远程插件需要访问 buf.build 并接受其服务条款，把"能否构建"绑在一个外部服务上。
+# 本地插件的版本由 tools.go 钉住，`go generate ./tools` 一次即可复现。
+#
+# 生成命令（在 backend/ 下执行，可重复执行，产物稳定）：
+#   go generate ./tools     # 安装钉住版本的 protoc-gen-go / protoc-gen-go-grpc
+#   buf generate            # 生成到 internal/aipb/
+#
+# 产物**必须入库**：CI 只跑 go vet / go test，不安装 buf 与插件，
+# 而 API/Worker 的编译依赖这些 stub。谁改了 proto，谁负责重新生成并一起提交。
+version: v2
+
+inputs:
+  # 显式指向 proto 目录，而不是让 buf 猜模块根（模块根已在 buf.yaml 里声明）。
+  - directory: api/proto
+
+managed:
+  enabled: true
+  override:
+    # 覆盖 proto 里的 go_package 前缀，保证生成产物的 import 路径与模块名一致。
+    # 只影响生成产物的 import 路径，不改 proto 契约本身。
+    - file_option: go_package_prefix
+      value: github.com/handlerzzy/feedsystem/internal/aipb
+
+plugins:
+  - local: protoc-gen-go
+    out: internal/aipb
+    opt:
+      - paths=source_relative
+  - local: protoc-gen-go-grpc
+    out: internal/aipb
+    opt:
+      - paths=source_relative
+      # 只生成 service 接口，不生成"必须被嵌入"的向前兼容桩：
+      # Go 侧是 client，服务端桩在这里只会变成死代码。
+      - require_unimplemented_servers=false

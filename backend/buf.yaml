@@ -1,0 +1,50 @@
+# buf 的模块定义。放在 backend/ 下是为了让所有命令与项目其余部分同根：
+# CI、Dockerfile 与开发者的工作目录都是 backend/，buf 不需要额外的 cd。
+#
+# `modules[0].path: api/proto` 把模块根指定在这一层，而不是自动推断出的 backend/：
+# proto 的 package 是 ai.v1，按 buf 的目录约定它必须位于 <模块根>/ai/v1；
+# 而 P0 要求文件落在约定俗成的 backend/api/proto/ai/v1/ 下。把模块根下移一层
+# 同时满足两者——生成时再配合 buf.gen.yaml 的 `paths=source_relative`，
+# 产物路径与原文件路径一一对应。
+#
+# 用 v2 而不是 v1：v1 的 modules 只能在 workspace 里声明，单独一个 buf.yaml
+# 无法把模块根下移（v1 里的 build/roots 在 v2 已被移除）。这里选当前版本的写法，
+# 避免留下一个"靠自动推断侥幸工作"的配置。
+#
+# 为什么不引入 buf.build 上的远程依赖（googleapis 等）：
+# P0 只定义 3 个方法、零外部消息类型，引入 buf.lock + `buf dep update`
+# 会让"能不能生成代码"依赖外网。当前 proto 自包含，断网也照样能生成。
+version: v2
+
+modules:
+  - path: api/proto
+
+lint:
+  use:
+    - STANDARD
+  except:
+    # 以下三条都是"标准规则"与既定契约之间的冲突，刻意豁免，理由逐条写明：
+
+    # 1. 服务名要求 Service 后缀。契约名 ModelGateway 已经写进 P0 文档与
+    #    sidecar/Go 两侧的调用代码，改名会让文档与代码立刻对不上。
+    - SERVICE_SUFFIX
+
+    # 2. Complete 与 CompleteStream 共用 CompleteRequest/CompleteResponse。
+    #    标准规则要求每个 RPC 有独立的请求消息（StreamCompleteRequest 之类），
+    #    那会把同一个请求体复制成两份，而两份必然漂移——流式与非流式的入参
+    #    在本项目里就是同一组参数，不该人为拆开。
+    #
+    #    注意规则名是 RPC_REQUEST_RESPONSE_UNIQUE（不是 _STANDARD_NAME）：
+    #    STANDARD 那一对管的是"消息名要叫 XxxRequest"，而这里两个方法的请求
+    #    本来就都叫 *Request，被拦下的是"同一个消息被多个 RPC 复用"这条。
+    #
+    #    同时豁免 STANDARD 那一对：CompleteStream 的响应叫 CompleteChunk
+    #    （流式的单位是"片"，叫 CompleteStreamResponse 会误导成"一次完整响应"），
+    #    规则要求它必须以 Response 结尾，两者只能取一个。
+    - RPC_REQUEST_RESPONSE_UNIQUE
+    - RPC_REQUEST_STANDARD_NAME
+    - RPC_RESPONSE_STANDARD_NAME
+
+breaking:
+  use:
+    - FILE

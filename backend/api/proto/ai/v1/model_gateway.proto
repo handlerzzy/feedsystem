@@ -1,0 +1,180 @@
+// ModelGateway —— Go 侧（client）与 Node sidecar（server）之间的唯一契约。
+//
+// 为什么单独抽一个 sidecar 而不是在 Go 里直接调模型 SDK：
+// 模型生态（多 provider、流式、token/成本计量、重试与限流）迭代速度远快于
+// 本项目的发布节奏，把它关在一个可独立部署、可独立回退、**可以整个删掉**的
+// 进程里，AI 才符合"锦上添花，不是承重墙"的定位。Go 侧只依赖下面这三个方法，
+// 换 provider / 换 SDK 不需要动业务代码，也不需要重新编译后端。
+//
+// 契约纪律（与 docs/AI-00-总览与全局约束.md 第 2 节红线同精神）：
+//   字段只增不删、不改语义、不重用已删除的 tag 号；新增字段必须可缺省。
+//   原因：Go 侧与 sidecar 是两个独立部署的进程，滚动升级期间新旧版本必然共存。
+//   删字段或改 tag 会让"老客户端 + 新服务端"在运行期直接解析错乱，
+//   而这类错在单测里永远发现不了。
+syntax = "proto3";
+
+package ai.v1;
+
+option go_package = "github.com/handlerzzy/feedsystem/internal/aipb/aiv1;aiv1";
+
+// ModelGateway 是模型能力的唯一入口。它刻意不知道任何业务概念
+// （没有"视频""标签""审核"这些词）：业务语义留在 Go 侧，sidecar 只做
+// "文本进、结构化结果出"的通用转换。这样 P1 打标、P3 审核、P4 Agent
+// 可以共用同一个 sidecar，而每次新增业务场景都不需要改协议。
+service ModelGateway {
+  // Complete 非流式补全，支持结构化（JSON）输出。P1/P3 走这个方法。
+  rpc Complete(CompleteRequest) returns (CompleteResponse);
+
+  // CompleteStream 流式补全。P0 只定义契约、不接业务，为 P4 运营 Agent 预留：
+  // Agent 的中间步骤需要边生成边展示，非流式接口无法承载。
+  rpc CompleteStream(CompleteRequest) returns (stream CompleteChunk);
+
+  // Health 健康检查与自描述。Go 侧用它判断"sidecar 在不在、能不能用"，
+  // 不使用 gRPC 标准 health 协议是为了让 sidecar 能顺便汇报自己配置了哪些
+  // provider、总开关是否打开——这决定了 Go 侧该走真实调用还是直接降级。
+  //
+  // serving=false 时调用方**应当**（SHOULD，不是 MUST）跳过 Complete 直接降级：
+  // 让一次注定失败的调用白吃一个超时预算是浪费。之所以不写成 MUST——
+  // 要求每个调用点缓存健康状态会引入"缓存过期"这一类新问题，
+  // 而多花的那一次往返在 2 秒预算里是可以接受的代价。
+  rpc Health(HealthRequest) returns (HealthResponse);
+
+  // Embed 批量生成文本向量。P2 的语义召回用它。
+  //
+  // 为什么单独一个方法而不是塞进 Complete：
+  //   - 语义完全不同。chat 是"生成"，embedding 是"编码"：没有 temperature、
+  //     没有 max_tokens、没有流式，但必须支持批量与维度声明；
+  //   - 传输链路也不同。本项目的 chat 走 pi-ai（只收录支持 function calling
+  //     的模型，**不含 embedding**），embedding 必须单独接一条
+  //     OpenAI 兼容的 /v1/embeddings 路径。硬塞进 Complete 只能靠在
+  //     prompt 里要一段 JSON 数字数组，那是必然出错的捷径；
+  //   - 配额与超时语义不同。混在一起之后，一次 embedding 超时会去影响
+  //     chat 的重试与熔断判断。
+  //
+  // 定死的取值（换模型必须同时改这里、Go 侧配置与向量表的 model/dim 记录）：
+  //   默认模型   text-embedding-3-small
+  //   默认维度   1536
+  //   默认归一化 true（L2）
+  // 这三条必须写进配置或注释，否则将来换模型要全量重算且无据可查。
+  rpc Embed(EmbedRequest) returns (EmbedResponse);
+}
+
+message CompleteRequest {
+  // model 留空时由 sidecar 按自身配置选默认模型。允许留空是刻意的：
+  // 换模型只改 sidecar 配置，不必让所有调用方跟着发版。
+  string model = 1;
+
+  // system / prompt 分开而不是拼成一条字符串：provider 的 system 角色
+  // 与用户消息在多数 SDK 里是不同参数，合并后无法再拆开。
+  string system = 2;
+  string prompt = 3;
+
+  // temperature / max_tokens 为 0 表示"用 sidecar 的默认值"。
+  // 不设 proto3 的 optional 是为了让 Go 侧零值语义简单：0 即未指定。
+  double temperature = 4;
+  int32 max_tokens = 5;
+
+  // response_format = "json" 时，sidecar 必须保证返回体是合法 JSON 对象；
+  // 无法保证时应返回错误，而不是把半截 JSON 当成功结果交回来
+  // （调用方据此入库，脏数据比失败更难查——见总览第 4 节）。
+  string response_format = 6;
+
+  // request_id 由 Go 侧生成，用于把一次业务请求在 Go 日志与 sidecar 日志
+  // 之间对起来。不含任何用户身份信息，避免把 PII 带出进程边界。
+  string request_id = 7;
+}
+
+message CompleteResponse {
+  // text 是模型输出的原始文本。结构化输出时调用方仍需自己校验 JSON：
+  // 协议层不替业务做 schema 校验，否则每个新场景都要改 proto。
+  string text = 1;
+  string model = 2;
+
+  // usage 用于成本核算。字段缺失（老 sidecar）时按 0 记账，不得因此报错。
+  Usage usage = 3;
+}
+
+message CompleteChunk {
+  // delta 是本片新增文本（不是累计全文），拼接语义由调用方决定。
+  string delta = 1;
+  // done 为 true 的那一片之后不会再有数据；usage 只在最后一片上有值。
+  bool done = 2;
+  Usage usage = 3;
+}
+
+message Usage {
+  int32 prompt_tokens = 1;
+  int32 completion_tokens = 2;
+  int32 total_tokens = 3;
+  // cost_usd 由 sidecar 按自己的价目表算出，Go 侧只做记录与上报。
+  double cost_usd = 4;
+}
+
+message EmbedRequest {
+  // inputs 是待向量化的文本列表，最多 64 条（见 sidecar 的校验）。
+  //
+  // 为什么是批量而不是单条：批量是 embedding 唯一能把吞吐做上去的方式。
+  // 回填历史视频时逐条调用会把延迟乘以条数，也会让"一次请求一次计费"
+  // 的账变得难以核对。上限 64 是"单请求体不要撑爆 gRPC 消息限制"的折中。
+  repeated string inputs = 1;
+
+  // model 留空时由 sidecar 按自身配置选默认 embedding 模型。
+  // 与 CompleteRequest.model 同样的理由：换模型只改 sidecar 配置。
+  string model = 2;
+
+  // normalize=true 时 sidecar 必须返回 **L2 归一化** 后的向量。
+  //
+  // 为什么把这件事放进协议而不是"由调用方自己归一化"：
+  // 归一化与否决定了余弦相似度能不能退化成点积，一旦两边理解不一致，
+  // 检索结果会静默变差（分数仍然"看起来正常"）。写进协议之后，
+  // 响应里的 normalized 字段还能回显实际行为，不一致立刻可查。
+  bool normalize = 3;
+
+  // request_id 由 Go 侧生成，用于把一次业务请求在 Go 日志与 sidecar 日志
+  // 之间对起来（与 CompleteRequest.request_id 同义）。
+  string request_id = 4;
+}
+
+message Embedding {
+  // values 是这一条文本的向量。**不要求**定长校验由协议层做：
+  // 调用方必须自己检查 len(values) == EmbedResponse.dim，
+  // 因为"某一行的维度不对"是真实会发生的（provider 截断、解析错位），
+  // 而带着错误维度入库的向量在检索时才暴露，且看起来像"模型效果差"。
+  repeated float values = 1;
+}
+
+message EmbedResponse {
+  // vectors 与请求的 inputs **一一对应且顺序一致**。
+  // 数量不匹配时调用方必须整批判为失败，不能"按能对上的部分入库"——
+  // 那会把文本与向量错配，而这种错误在检索结果里完全看不出来。
+  repeated Embedding vectors = 1;
+
+  string model = 2;
+
+  // dim 是所有向量的维度。换模型/换维度时它一定会变，
+  // 调用方据此判断已入库的向量是否失效（必须重算）。
+  int32 dim = 3;
+
+  // normalized 回显 sidecar 实际做的处理（不是回显请求）。
+  // 请求 true 而响应 false 说明对端实现有分歧，调用方可以据此拒绝入库。
+  bool normalized = 4;
+
+  // usage 复用 Usage：embedding 的输入量填在 prompt_tokens/total_tokens，
+  // completion_tokens 恒为 0。复用而不是新开一个消息，是为了让
+  // "成本核算"在所有模型调用上只有一套口径。
+  Usage usage = 5;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  // serving = false 表示 sidecar 活着但**不提供模型服务**（总开关关闭或
+  // 一个 provider key 都没配）。此时 Go 侧必须直接降级，不要去调 Complete：
+  // 让它失败再降级会白白吃掉一次超时预算。
+  bool serving = 1;
+  string version = 2;
+  // providers 是已配置 key 的 provider 名，仅用于诊断展示；不得包含 key 本身。
+  repeated string providers = 3;
+  // detail 是给人看的诊断信息。**禁止**写入任何密钥或密钥片段。
+  string detail = 4;
+}

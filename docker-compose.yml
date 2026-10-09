@@ -1,0 +1,223 @@
+# 固定 compose 项目名，避免容器名随仓库目录名变化
+# （e2e_regression.sh 与 verify.sh 依赖 <项目名>-<服务>-1 这种容器名）。
+name: feedflow
+
+services:
+  mysql:
+    image: mysql:8.0
+    restart: always
+    container_name: feedflow-mysql-1
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-123456}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-feedflow}
+      TZ: "Asia/Shanghai"
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    command:
+      - --default-authentication-plugin=mysql_native_password
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$${MYSQL_ROOT_PASSWORD} --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    container_name: feedflow-redis-1
+    image: redis:7-alpine
+    restart: always
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-123456}
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:-123456}"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  rabbitmq:
+    container_name: feedflow-rabbitmq-1
+    image: rabbitmq:3-management
+    restart: always
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-admin}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS:-password123}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD-SHELL", "rabbitmq-diagnostics -q ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  backend:
+    container_name: feedflow-backend-1
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      target: api
+    restart: always
+    environment:
+      CONFIG_PATH: /app/configs/config.yaml
+      JWT_SECRET: ${JWT_SECRET:-feedflow-dev-secret-key}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-feedflow}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-123456}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-123456}
+      RABBITMQ_USER: ${RABBITMQ_USER:-admin}
+      RABBITMQ_PASS: ${RABBITMQ_PASS:-password123}
+      # AI 总开关（默认关）。**必须**同时给 API 与 Worker：
+      # 只给 sidecar 的话，运维敲下 AI_ENABLED=false 只能关掉 sidecar，
+      # 而 Go 侧仍按配置文件里的值继续发起模型调用——"统一总开关"就失效了。
+      AI_ENABLED: ${AI_ENABLED:-false}
+      # embedding 的模型名与维度必须与 sidecar 完全一致：
+      # Go 侧用维度做**本地校验**（见 internal/ai/ValidateEmbeddingResult），
+      # 两边不一致时会立刻失败，而不是让两种维度的向量混进同一张表。
+      # 用同一个变量喂三个服务，是为了让"不一致"在结构上不可能发生。
+      AI_EMBEDDING_MODEL: ${AI_EMBEDDING_MODEL:-text-embedding-3-small}
+      AI_EMBEDDING_DIM: ${AI_EMBEDDING_DIM:-1536}
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./backend/configs/config.docker.yaml:/app/configs/config.yaml:ro
+      - backend_uploads:/app/.run/uploads
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      # 用 /livez（只判进程存活）：/readyz 在依赖故障时会返回非 200，
+      # 拿它做 healthcheck 会导致编排层反复重启一个本可降级工作的实例。
+      # /readyz 供人工排查与监控使用。
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/livez || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  worker:
+    container_name: feedflow-worker-1
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      target: worker
+    restart: always
+    environment:
+      CONFIG_PATH: /app/configs/config.yaml
+      JWT_SECRET: ${JWT_SECRET:-feedflow-dev-secret-key}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-feedflow}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-123456}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-123456}
+      RABBITMQ_USER: ${RABBITMQ_USER:-admin}
+      RABBITMQ_PASS: ${RABBITMQ_PASS:-password123}
+      # 见 backend 服务里的说明：总开关必须两边一致。
+      AI_ENABLED: ${AI_ENABLED:-false}
+      # 见 backend 服务里的说明：向量模型与维度必须三个服务一致。
+      AI_EMBEDDING_MODEL: ${AI_EMBEDDING_MODEL:-text-embedding-3-small}
+      AI_EMBEDDING_DIM: ${AI_EMBEDDING_DIM:-1536}
+    volumes:
+      - ./backend/configs/config.docker.yaml:/app/configs/config.yaml:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep worker || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  frontend:
+    container_name: feedflow-frontend-1
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    restart: always
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:80/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # AI 能力的 sidecar（Node/TS 的 ModelGateway gRPC 服务）。
+  #
+  # 三条刻意的设计决定，改之前请先读 docs/AI-00-总览与全局约束.md：
+  #
+  #  1. **没有任何服务 depends_on 它**，它自己也不 depends_on 任何服务。
+  #     反向依赖会制造"sidecar 起不来 → API/Worker 起不来"的故障放大，
+  #     而 AI 的定位是锦上添花。停掉整个 sidecar 服务，主系统必须照常工作。
+  #  2. **不加 healthcheck**：它随时可以被关掉，"活着但不提供服务"（没配 key）
+  #     是合法状态，不该被编排层反复重启。想知道能不能用，
+  #     调 ModelGateway.Health 看 serving 字段。
+  #  3. **API key 只出现在这个服务里**，父进程只通过 gRPC 找它。
+  #     key 绝不出现在日志、错误信息与响应体中（sidecar 侧有测试守着）。
+  sidecar:
+    container_name: feedflow-sidecar-1
+    build:
+      context: .
+      dockerfile: sidecar/Dockerfile
+    restart: always
+    environment:
+      # 总开关默认关：不显式打开时，即使配了 key 也不会发起任何模型调用。
+      AI_ENABLED: ${AI_ENABLED:-false}
+      AI_DEFAULT_MODEL: ${AI_DEFAULT_MODEL:-gpt-4o-mini}
+      AI_MAX_TOKENS: ${AI_MAX_TOKENS:-512}
+      # 计量日志落盘在容器内（不挂卷：AI 计量属于可丢的观测数据，
+      # 且这个进程必须能被整体删除而不留下状态）。
+      AI_USAGE_LOG: /tmp/ai-usage.jsonl
+      # 离线演示开关（P2 前置 S2）：**必须**从环境变量透出来，否则
+      # "为了让验收项可复现而造的离线模式"只能绕过 compose、直接 npx tsx 跑，
+      # 也就是说演示与 CI 用的不是同一套装配。
+      #
+      # 默认全空 = 走真实 provider 路径；不设置这两个变量时行为与以前完全一致。
+      AI_PROVIDER: ${AI_PROVIDER:-}
+      AI_FAUX_RESPONSE: ${AI_FAUX_RESPONSE:-}
+      # 多条脚本化应答（JSON 字符串数组，按序循环）。
+      # 单条响应模式在一次进程生命周期内只能成功应答**一次**，
+      # 连续发布两条视频就会失败——批量演示与评测都需要它。
+      AI_FAUX_RESPONSES: ${AI_FAUX_RESPONSES:-}
+      # embedding 通道（与 chat 分开配置：pi-ai 不提供 embedding，
+      # sidecar 走的是另一条 OpenAI 兼容的 /v1/embeddings 路径）。
+      AI_EMBEDDING_MODEL: ${AI_EMBEDDING_MODEL:-text-embedding-3-small}
+      AI_EMBEDDING_DIM: ${AI_EMBEDDING_DIM:-1536}
+      AI_EMBEDDING_NORMALIZE: ${AI_EMBEDDING_NORMALIZE:-true}
+      # 自建/代理的兼容端点用这两个变量；都留空时不做任何向量调用。
+      AI_EMBEDDING_BASE_URL: ${AI_EMBEDDING_BASE_URL:-}
+      AI_EMBEDDING_API_KEY: ${AI_EMBEDDING_API_KEY:-}
+      # provider 凭据。一个都不配时 sidecar 仍能正常启动，只是不提供服务。
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+    ports:
+      # 只映射到宿主机回环：便于本地用 grpcurl 调试，且不把模型网关暴露到局域网。
+      - "127.0.0.1:50051:50051"
+
+volumes:
+  # 显式命名：默认卷名会带 compose 项目名前缀，改项目名就会得到一批空卷。
+  # 这里沿用改名前的实际卷名，保证切换项目名不丢数据。
+  mysql_data:
+    name: feedsystem_video_go-medium_mysql_data
+  redis_data:
+    name: feedsystem_video_go-medium_redis_data
+  rabbitmq_data:
+    name: feedsystem_video_go-medium_rabbitmq_data
+  backend_uploads:
+    name: feedsystem_video_go-medium_backend_uploads

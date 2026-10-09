@@ -1,0 +1,63 @@
+.run/
+backend/.run/
+data/
+.sisyphus/
+docs/
+
+# 个人开发/学习材料：只留本地，不入库
+简历项目描述.md
+AI-P2-设计决定.md
+FeedFlow-项目设计.md
+
+# 求职材料：含真实姓名/手机号/邮箱/微信，绝不入库
+.interview-work/
+resume.md
+resume.html
+resume.pdf
+resume-preview.png
+print-resume.mjs
+
+# 离线评测产物：由 backend/testdata/eval/regenerate.sh 生成，不入库
+# （真实快照来自本机开发库，合成快照虽逐字节可复现，但都是产物而非源码）
+backend/testdata/eval/snapshot*.json
+backend/testdata/eval/baseline*.json
+backend/testdata/eval/baseline*.md
+backend/testdata/eval/p2*.json
+backend/testdata/eval/p2*.md
+
+#
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Code coverage profiles and other test artifacts
+*.out
+coverage.*
+*.coverprofile
+profile.cov
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+
+# Go workspace file
+go.work
+go.work.sum
+
+# env file
+.env
+
+# Node 依赖（frontend 与 AI sidecar 都是 Node 项目）
+node_modules/
+
+# AI sidecar 的计量日志：属于可丢的观测数据，不入库
+ai-usage.jsonl
+
+# Editor/IDE
+.idea/
+.vscode/

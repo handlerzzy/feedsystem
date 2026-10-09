@@ -1,0 +1,25 @@
+{
+  "name": "feedflow-ai-sidecar",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ModelGateway sidecar：把模型能力的多 provider/流式/计量关在一个可独立部署、可整体删除的进程里",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "tsx src/server.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test src/*.test.ts"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "1.0.4",
+    "@grpc/grpc-js": "1.14.5",
+    "@grpc/proto-loader": "0.8.1"
+  },
+  "devDependencies": {
+    "@types/node": "22.10.2",
+    "tsx": "4.19.2",
+    "typescript": "5.7.2"
+  }
+}

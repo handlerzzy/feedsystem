@@ -1,0 +1,98 @@
+package video
+
+import (
+	"github.com/handlerzzy/feedsystem/internal/account"
+	"github.com/handlerzzy/feedsystem/internal/apierror"
+	"github.com/handlerzzy/feedsystem/internal/middleware/jwt"
+
+	"github.com/gin-gonic/gin"
+)
+
+type CommentHandler struct {
+	service        *CommentService
+	accountService *account.AccountService
+}
+
+func NewCommentHandler(service *CommentService, accountService *account.AccountService) *CommentHandler {
+	return &CommentHandler{service: service, accountService: accountService}
+}
+func (h *CommentHandler) PublishComment(c *gin.Context) {
+	var req PublishCommentRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		apierror.Respond(c, err)
+		return
+	}
+	if req.Content == "" {
+		c.JSON(400, gin.H{"error": "content is required"})
+		return
+	}
+	if req.VideoID <= 0 {
+		c.JSON(400, gin.H{"error": "video_id is required"})
+		return
+	}
+	authorId, err := jwt.GetAccountID(c)
+	if err != nil {
+		apierror.Respond(c, err)
+		return
+	}
+	user, err := h.accountService.FindByID(c.Request.Context(), authorId)
+	if err != nil {
+		apierror.Respond(c, err)
+		return
+	}
+	comment := &Comment{
+		Username: user.Username,
+		VideoID:  req.VideoID,
+		AuthorID: authorId,
+		Content:  req.Content,
+	}
+	if err := h.service.Publish(c.Request.Context(), comment); err != nil {
+		apierror.Respond(c, err)
+		return
+	}
+	c.JSON(200, gin.H{"message": "comment published successfully"})
+}
+
+func (h *CommentHandler) DeleteComment(c *gin.Context) {
+	var req DeleteCommentRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		apierror.Respond(c, err)
+		return
+	}
+	accountID, err := jwt.GetAccountID(c)
+	if err != nil {
+		apierror.Respond(c, err)
+		return
+	}
+	if req.CommentID <= 0 {
+		c.JSON(400, gin.H{"error": "comment_id is required"})
+		return
+	}
+	if err := h.service.Delete(c.Request.Context(), req.CommentID, accountID); err != nil {
+		apierror.Respond(c, err)
+		return
+	}
+
+	c.JSON(200, gin.H{"message": "comment deleted successfully"})
+}
+
+func (h *CommentHandler) GetAllComments(c *gin.Context) {
+	var req GetAllCommentsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		apierror.Respond(c, err)
+		return
+	}
+	if req.VideoID == 0 {
+		c.JSON(400, gin.H{"error": "video_id is required"})
+		return
+	}
+	comments, err := h.service.GetAll(c.Request.Context(), req.VideoID)
+	if err != nil {
+		apierror.Respond(c, err)
+		return
+	}
+	if comments == nil {
+		comments = []Comment{}
+	}
+	c.JSON(200, comments)
+}
